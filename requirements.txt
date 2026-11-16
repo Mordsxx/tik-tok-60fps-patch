@@ -1,0 +1,4 @@
+# runtime: standard library only (Tkinter ships with Python)
+tkinterdnd2>=0.3.0      # optional: enables drag-and-drop of MP4 files
+# build
+pyinstaller>=6.0
