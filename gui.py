@@ -1,20 +1,28 @@
-"""Dark Tkinter interface for TikTok 60FPS Patch (drag-and-drop if tkinterdnd2 exists)."""
+"""TikTok 60FPS Patch - liquid-glass interface.
+
+Everything is drawn on one Canvas: an animated blurred-blob background that reacts to the
+mouse, frosted glass panels, pill buttons with hover glow + click ripples, and a liquid
+progress bar.  Pillow renders the visuals; Tk draws the text on top.
+"""
 from __future__ import annotations
 
+import math
 import os
 import queue
 import subprocess
 import sys
 import threading
-import tkinter as tk
+import time
 import webbrowser
 from fractions import Fraction
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
+import tkinter as tk
+
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
 
 from mp4_parser import MP4Error
 from mp4_patcher import Cancelled, patch_file, unique_output_path
-from ui_logic import fmt, fps_to_factor, out_suffix, parse_factor, parse_factor_loose
 from video_analyzer import analyze
 
 try:
@@ -28,13 +36,24 @@ APP_NAME = "TikTok 60FPS Patch"
 CREDIT_TEXT = "Made by Mords"
 TIKTOK_TEXT = "TikTok: @Mords_69"
 TIKTOK_URL = "https://www.tiktok.com/@Mords_69"
+FACTOR = Fraction(2)                   # fixed: 60 FPS -> 30 FPS, 2x slower
 
-# ------------------------------------------------------------------ theme
-BG, CARD, FIELD, BORDER = "#0e0f14", "#171922", "#212432", "#2b2f40"
-TEXT, MUTED = "#eceef5", "#8b91a5"
-ACCENT, ACCENT_H = "#8b5cf6", "#a07bff"
-OK, ERR, WARN = "#34d399", "#ff5d6c", "#fbbf24"
-F = "Segoe UI"
+# ------------------------------------------------------------------ look
+W, H = 560, 820
+LOW = 4                                # background is rendered at 1/4 size, then upscaled
+TEXT, MUTED = "#f1f2f8", "#9aa0b6"
+ACCENT, CYAN, OK, ERR, WARN = "#a78bfa", "#67e8f9", "#34d399", "#ff6b7a", "#fbbf24"
+FONT = "Segoe UI"
+PAD, SS = 12, 3
+
+PANELS = {"drop": (20, 104, 540, 196), "info": (20, 208, 540, 360),
+          "set": (20, 372, 540, 454), "res": (20, 586, 540, 752),
+          "foot": (110, 764, 450, 808)}
+BAR = (20, 532, 540, 546)
+
+
+def px(points: float) -> int:          # pixel-sized fonts keep layout DPI-independent
+    return -int(round(points * 1.33))
 
 
 def res(name: str) -> Path:
@@ -42,233 +61,332 @@ def res(name: str) -> Path:
     return Path(base) / name
 
 
-def _size(n: float) -> str:
+def fmt(x, digits: int = 2) -> str:
+    return (f"{float(x):.{digits}f}".rstrip("0").rstrip(".")) or "0"
+
+
+def size_text(n: float) -> str:
     for u in ("B", "KB", "MB", "GB"):
         if n < 1024 or u == "GB":
             return f"{int(n)} B" if u == "B" else f"{n:.1f} {u}"
         n /= 1024
 
 
+def ellipsize(s: str, n: int, tail: bool = False) -> str:
+    if len(s) <= n:
+        return s
+    return "…" + s[-(n - 1):] if tail else s[:n - 1] + "…"
+
+
+class Btn:
+    def __init__(self, name, rect, text, style, cmd):
+        self.name, self.rect, self.text, self.style, self.cmd = name, rect, text, style, cmd
+        self.enabled, self.hover, self.target = True, 0.0, 0.0
+        self.ripples: list = []
+        self.text_id = None
+
+    def hit(self, x, y):
+        x0, y0, x1, y1 = self.rect
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+
 class App:
     def __init__(self):
         self.root = r = _Root()
         r.title(APP_NAME)
-        r.configure(bg=BG)
-        r.geometry("620x820")
-        r.minsize(580, 760)
+        r.geometry(f"{W}x{H}")
+        r.resizable(False, False)
+        r.configure(bg="#0b0c12")
         try:
             r.iconbitmap(str(res("app.ico")))
         except Exception:
             pass
+        self.canvas = c = tk.Canvas(r, width=W, height=H, highlightthickness=0, bd=0, bg="#0b0c12")
+        c.pack()
+
+        # state
         self.src: Path | None = None
         self.src_fps: Fraction | None = None
+        self.out_dir = ""
         self.last_out: Path | None = None
         self.worker: threading.Thread | None = None
         self.q: queue.Queue = queue.Queue()
         self.cancel_ev = threading.Event()
+        self.progress, self.show_bar = 0.0, False
+        self.t, self.energy = 0.0, 1.0
+        self.mx, self.my = W / 2 / LOW, H / 2 / LOW
+        self.mtx, self.mty = self.mx, self.my
+        self._tile_cache: dict = {}
+        self._last = time.perf_counter()
 
-        self.drop_var = tk.StringVar(value="Drop an MP4 here\nor click to browse")
-        self.out_dir = tk.StringVar()
-        self.factor_var = tk.StringVar(value="2")
-        self.fps_var = tk.StringVar(value="")
-        self.mode_var = tk.StringVar(value="2× slower")
-        self.status_var = tk.StringVar(value="Select an MP4 file to begin.")
-        keys = ("Size", "Resolution", "Frame rate", "Duration", "Video", "Audio", "Frames")
-        self.info = {k: tk.StringVar(value="—") for k in keys}
-        self.done = {k: tk.StringVar(value="—") for k in
-                     ("File", "Duration", "Frame rate", "Size", "Time")}
-        self._style()
-        self._build()
-        r.after(80, self._poll)
+        self._build_background()
+        self._build_panels()
+        self._build_widgets()
+        self.photo = ImageTk.PhotoImage(self._render(self._last))
+        self.bg_id = c.create_image(0, 0, anchor="nw", image=self.photo)
+        c.tag_lower(self.bg_id)
+        c.bind("<Motion>", self._motion)
+        c.bind("<Leave>", self._leave)
+        c.bind("<Button-1>", self._click)
+        if DND_FILES:
+            try:
+                c.drop_target_register(DND_FILES)
+                c.dnd_bind("<<Drop>>", self._on_drop)
+            except Exception:
+                pass
+        r.after(33, self._tick)
 
-    # ------------------------------------------------------------ widgets
-    def _style(self):
-        st = ttk.Style()
+    # ============================================================ visuals
+    def _build_background(self):
+        lw, lh = W // LOW, H // LOW
+        base = Image.new("RGB", (lw, lh))
+        d = ImageDraw.Draw(base)
+        for y in range(lh):
+            k = y / lh
+            d.line([(0, y), (lw, y)], fill=(int(14 - 6 * k), int(15 - 6 * k), int(27 - 11 * k)))
+        self.base = base
+        spr = Image.radial_gradient("L").point(lambda v: int(255 * (1 - min(1.0, v / 180)) ** 2 * 0.95))
+        specs = [  # colour, radius, centre, amplitude, speed, phase
+            ((124, 92, 246), 62, (0.25, 0.20), (0.18, 0.10), (0.55, 0.43), (0.0, 1.0)),
+            ((56, 189, 248), 56, (0.80, 0.45), (0.16, 0.14), (0.40, 0.62), (2.0, 0.5)),
+            ((244, 114, 182), 54, (0.30, 0.78), (0.20, 0.12), (0.47, 0.36), (4.0, 2.2)),
+            ((45, 212, 191), 40, (0.78, 0.88), (0.14, 0.08), (0.62, 0.50), (1.2, 3.1)),
+        ]
+        self.blobs = []
+        for col, rad, (cx, cy), (ax, ay), (wx, wy), (px_, py_) in specs:
+            self.blobs.append(dict(col=Image.new("RGB", (2 * rad, 2 * rad), col),
+                                   mask=spr.resize((2 * rad, 2 * rad), Image.BILINEAR), r=rad,
+                                   cx=cx * lw, cy=cy * lh, ax=ax * lw, ay=ay * lh,
+                                   wx=wx, wy=wy, px=px_, py=py_))
+        self.mouse_blob = dict(col=Image.new("RGB", (92, 92), (167, 139, 250)),
+                               mask=spr.resize((92, 92), Image.BILINEAR), r=46)
+
+    def _build_panels(self):
+        s = 2
+        layer = Image.new("RGBA", (W * s, H * s), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        for name, (x0, y0, x1, y1) in PANELS.items():
+            r = (y1 - y0) // 2 if name == "foot" else 22
+            d.rounded_rectangle((x0 * s, y0 * s, x1 * s, y1 * s), radius=r * s,
+                                fill=(14, 15, 26, 150), outline=(255, 255, 255, 46), width=s)
+        bx0, by0, bx1, by1 = BAR
+        d.rounded_rectangle((bx0 * s, by0 * s, bx1 * s, by1 * s), radius=7 * s,
+                            fill=(255, 255, 255, 24), outline=(255, 255, 255, 34), width=s)
+        d.ellipse((22 * s, 18 * s, 82 * s, 78 * s), outline=(167, 139, 250, 170), width=2 * s)
+        layer = layer.resize((W, H), Image.LANCZOS)
         try:
-            st.theme_use("clam")
-        except tk.TclError:
-            pass
-        st.configure("A.Horizontal.TProgressbar", troughcolor=FIELD, background=ACCENT,
-                     bordercolor=BG, lightcolor=ACCENT, darkcolor=ACCENT, thickness=10)
-
-    def _label(self, parent, text="", var=None, fg=TEXT, bg=CARD, size=10, bold=False, **kw):
-        font = (F, size, "bold") if bold else (F, size)
-        if var is not None:
-            return tk.Label(parent, textvariable=var, fg=fg, bg=bg, font=font, **kw)
-        return tk.Label(parent, text=text, fg=fg, bg=bg, font=font, **kw)
-
-    def _card(self, title: str):
-        outer = tk.Frame(self.root, bg=BG)
-        outer.pack(fill="x", padx=20, pady=(0, 10))
-        self._label(outer, title.upper(), fg=MUTED, bg=BG, size=8, bold=True).pack(anchor="w", pady=(0, 4))
-        body = tk.Frame(outer, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
-        body.pack(fill="x")
-        return body
-
-    def _entry(self, parent, var, width=9):
-        return tk.Entry(parent, textvariable=var, width=width, bg=FIELD, fg=TEXT,
-                        insertbackground=TEXT, relief="flat", font=(F, 11), justify="center",
-                        highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
-
-    def _button(self, parent, text, cmd, primary=False, **kw):
-        bg = ACCENT if primary else FIELD
-        hover = ACCENT_H if primary else BORDER
-        b = tk.Button(parent, text=text, command=cmd, bg=bg, fg="#ffffff" if primary else TEXT,
-                      activebackground=hover, activeforeground="#ffffff", relief="flat", bd=0,
-                      cursor="hand2", font=(F, 10, "bold"), padx=14, pady=8,
-                      disabledforeground=MUTED, **kw)
-        b._bg, b._hover = bg, hover
-        b.bind("<Enter>", lambda e: b["state"] == "normal" and b.config(bg=b._hover))
-        b.bind("<Leave>", lambda e: b.config(bg=b._bg if b["state"] == "normal" else FIELD))
-        return b
-
-    @staticmethod
-    def _enable(btn, on: bool):
-        btn.config(state="normal" if on else "disabled", bg=btn._bg if on else FIELD)
-
-    def _build(self):
-        # header
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(fill="x", padx=20, pady=(18, 12))
-        try:
-            self.logo = tk.PhotoImage(file=str(res("app_icon.png")))
-            tk.Label(head, image=self.logo, bg=BG, bd=0).pack(side="left", padx=(0, 14))
+            logo = Image.open(res("app_icon.png")).convert("RGBA").resize((52, 52), Image.LANCZOS)
+            m = Image.new("L", (208, 208), 0)
+            ImageDraw.Draw(m).ellipse((0, 0, 207, 207), fill=255)
+            layer.paste(logo, (26, 22), m.resize((52, 52), Image.LANCZOS))
         except Exception:
             pass
-        t = tk.Frame(head, bg=BG)
-        t.pack(side="left")
-        self._label(t, APP_NAME, bg=BG, size=18, bold=True).pack(anchor="w")
-        self._label(t, "Slow 60 FPS to 30 FPS by editing timing only — no re-encode",
-                    fg=MUTED, bg=BG, size=9).pack(anchor="w")
+        self.panels = layer
 
-        # 1. video
-        c = self._card("1  ·  Video")
-        self.drop = tk.Label(c, textvariable=self.drop_var, bg=FIELD, fg=TEXT, font=(F, 11),
-                             pady=16, cursor="hand2", justify="center")
-        self.drop.pack(fill="x", padx=12, pady=12)
-        self.drop.bind("<Button-1>", lambda e: self.browse())
-        if DND_FILES:
-            for w in (self.drop, self.root):
-                w.drop_target_register(DND_FILES)
-                w.dnd_bind("<<Drop>>", self._on_drop)
+    def _gradient(self, w, h, cols, lift=0.0):
+        g = Image.new("RGB", (len(cols), 1))
+        for i, c in enumerate(cols):
+            g.putpixel((i, 0), tuple(int(v + (255 - v) * lift) for v in c))
+        return g.resize((w, h), Image.BILINEAR)
 
-        # 2. info
-        c = self._card("2  ·  Video information")
-        g = tk.Frame(c, bg=CARD)
-        g.pack(fill="x", padx=12, pady=10)
-        for i, (k, v) in enumerate(self.info.items()):
-            r, col = divmod(i, 2)
-            cell = tk.Frame(g, bg=CARD)
-            cell.grid(row=r, column=col, sticky="w", padx=(0, 30), pady=3)
-            self._label(cell, k, fg=MUTED, size=8).pack(anchor="w")
-            self._label(cell, var=v, size=10, bold=True).pack(anchor="w")
-        g.grid_columnconfigure(0, weight=1)
-        g.grid_columnconfigure(1, weight=1)
-
-        # 3. settings
-        c = self._card("3  ·  Settings")
-        row = tk.Frame(c, bg=CARD)
-        row.pack(fill="x", padx=12, pady=(12, 4))
-        for col, (title, var, handler) in enumerate((("Slow-down  ×", self.factor_var, self._factor_typed),
-                                                     ("Output FPS", self.fps_var, self._fps_typed))):
-            box = tk.Frame(row, bg=CARD)
-            box.pack(side="left", padx=(0, 20))
-            self._label(box, title, fg=MUTED, size=8).pack(anchor="w")
-            e = self._entry(box, var)
-            e.pack(ipady=6)
-            e.bind("<KeyRelease>", handler)
-        chips = tk.Frame(row, bg=CARD)
-        chips.pack(side="left", anchor="s")
-        for val in ("1.5", "2", "3", "4"):
-            b = self._button(chips, f"{val}×", lambda v=val: self._chip(v))
-            b.config(padx=9, pady=5)
-            b.pack(side="left", padx=2)
-        self._label(c, var=self.mode_var, fg=ACCENT_H, size=10, bold=True).pack(anchor="w", padx=12, pady=(4, 6))
-        row = tk.Frame(c, bg=CARD)
-        row.pack(fill="x", padx=12, pady=(0, 12))
-        self._label(row, "Output folder", fg=MUTED, size=8).pack(anchor="w")
-        line = tk.Frame(row, bg=CARD)
-        line.pack(fill="x")
-        e = tk.Entry(line, textvariable=self.out_dir, bg=FIELD, fg=TEXT, insertbackground=TEXT,
-                     relief="flat", font=(F, 10), highlightthickness=1,
-                     highlightbackground=BORDER, highlightcolor=ACCENT)
-        e.pack(side="left", fill="x", expand=True, ipady=6)
-        self._button(line, "Browse", self.pick_dir).pack(side="left", padx=(8, 0))
-
-        # controls
-        bar = tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=20, pady=(2, 8))
-        self.btn_start = self._button(bar, "Start Processing", self.start, primary=True)
-        self.btn_start.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        self.btn_cancel = self._button(bar, "Cancel", self.cancel)
-        self.btn_cancel.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self._enable(self.btn_start, False)
-        self._enable(self.btn_cancel, False)
-        self.bar = ttk.Progressbar(self.root, maximum=100, style="A.Horizontal.TProgressbar")
-        self.bar.pack(fill="x", padx=20)
-        self.status_lbl = self._label(self.root, var=self.status_var, fg=MUTED, bg=BG, size=9,
-                                      wraplength=560, justify="center")
-        self.status_lbl.pack(padx=20, pady=6)
-
-        # result
-        c = self._card("Result")
-        g = tk.Frame(c, bg=CARD)
-        g.pack(fill="x", padx=12, pady=(10, 4))
-        for i, (k, v) in enumerate(self.done.items()):
-            self._label(g, k, fg=MUTED, size=9).grid(row=i, column=0, sticky="w", pady=1)
-            self._label(g, var=v, size=10, bold=True).grid(row=i, column=1, sticky="w", padx=14)
-        self.btn_open = self._button(c, "Open Output Folder", self.open_folder)
-        self.btn_open.pack(pady=(4, 12))
-        self._enable(self.btn_open, False)
-
-        # footer / credits
-        foot = tk.Frame(self.root, bg=BG)
-        foot.pack(side="bottom", fill="x", pady=(0, 12))
-        tk.Frame(foot, bg=BORDER, height=1).pack(fill="x", padx=20, pady=(0, 8))
-        self._label(foot, CREDIT_TEXT, fg=MUTED, bg=BG, size=9).pack()
-        link = self._label(foot, TIKTOK_TEXT, fg=ACCENT_H, bg=BG, size=9, bold=True, cursor="hand2")
-        link.pack()
-        link.bind("<Button-1>", lambda e: webbrowser.open(TIKTOK_URL))
-
-    # ------------------------------------------------------------ helpers
-    def _set_status(self, text: str, kind: str = "info"):
-        self.status_var.set(text)
-        self.status_lbl.config(fg={"info": MUTED, "ok": OK, "err": ERR, "warn": WARN}[kind])
-
-    def _refresh_mode(self):
-        f = parse_factor_loose(self.factor_var.get())
-        if not f:
-            self.mode_var.set("Enter a number such as 2 or 1.5")
-        elif self.src_fps:
-            self.mode_var.set(f"{fmt(self.src_fps, 2)} FPS  →  {fmt(self.src_fps / f, 2)} FPS"
-                              f"   ·   {fmt(f, 2)}× slower")
+    def _button_tile(self, b: Btn, now: float):
+        x0, y0, x1, y1 = b.rect
+        w, h = x1 - x0, y1 - y0
+        b.ripples = [rp for rp in b.ripples if now - rp[0] < 0.7]
+        key = (b.name, int(b.hover * 8 + 0.5), b.enabled)
+        if not b.ripples and key in self._tile_cache:
+            return self._tile_cache[key]
+        w2, h2 = w * SS, h * SS
+        rad = 22 if b.style == "zone" else h // 2
+        mask = Image.new("L", (w2, h2), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, w2 - 1, h2 - 1), radius=rad * SS, fill=255)
+        hv = b.hover
+        glow_col = (124, 92, 246)
+        if b.style == "primary" and b.enabled:
+            fill = self._gradient(w2, h2, [(124, 92, 246), (99, 102, 241), (56, 189, 248)],
+                                  lift=hv * 0.14).convert("RGBA")
+            fill.putalpha(mask)
+            outline = (255, 255, 255, 80)
         else:
-            self.mode_var.set(f"{fmt(f, 2)}× slower")
+            a = int((14 + hv * 34) if b.enabled else 9)
+            fill = Image.new("RGBA", (w2, h2), (255, 255, 255, a))
+            fill.putalpha(ImageChops.multiply(fill.getchannel("A"), mask))
+            outline = (167, 139, 250, int(46 + hv * 170)) if b.style == "zone" else \
+                      (255, 255, 255, int(48 + hv * 70) if b.enabled else 26)
+            glow_col = (167, 139, 250)
+        ol = Image.new("RGBA", (w2, h2), (0, 0, 0, 0))
+        ImageDraw.Draw(ol).rounded_rectangle((0, 0, w2 - 1, h2 - 1), radius=rad * SS,
+                                             outline=outline, width=SS)
+        fill.alpha_composite(ol)
+        for t0, rx, ry in b.ripples:
+            p = (now - t0) / 0.7
+            rr = max(w, h) * 1.15 * p * SS
+            cm = Image.new("L", (w2, h2), 0)
+            ImageDraw.Draw(cm).ellipse((rx * SS - rr, ry * SS - rr, rx * SS + rr, ry * SS + rr),
+                                       fill=int(120 * (1 - p)))
+            cm = ImageChops.multiply(cm, mask)
+            wl = Image.new("RGBA", (w2, h2), (255, 255, 255, 0))
+            wl.putalpha(cm)
+            fill.alpha_composite(wl)
+        tile = Image.new("RGBA", (w + 2 * PAD, h + 2 * PAD), (0, 0, 0, 0))
+        if hv > 0.02 and b.enabled:
+            gm = Image.new("L", tile.size, 0)
+            ImageDraw.Draw(gm).rounded_rectangle((PAD, PAD, PAD + w, PAD + h), radius=rad,
+                                                 fill=int(120 * hv))
+            gc = Image.new("RGBA", tile.size, glow_col + (0,))
+            gc.putalpha(gm.filter(ImageFilter.GaussianBlur(7)))
+            tile.alpha_composite(gc)
+        tile.alpha_composite(fill.resize((w, h), Image.LANCZOS), (PAD, PAD))
+        if not b.ripples:
+            self._tile_cache[key] = tile
+        return tile
 
-    def _factor_typed(self, *_):
-        f = parse_factor_loose(self.factor_var.get())
-        if f and self.src_fps:
-            self.fps_var.set(fmt(self.src_fps / f, 2))
-        self._refresh_mode()
+    def _bar_tile(self, frac: float, phase: float):
+        w, h = BAR[2] - BAR[0], BAR[3] - BAR[1]
+        w2, h2 = w * SS, h * SS
+        track = Image.new("L", (w2, h2), 0)
+        ImageDraw.Draw(track).rounded_rectangle((0, 0, w2 - 1, h2 - 1), radius=h2 // 2, fill=255)
+        edge = frac * w2
+        m = Image.new("L", (w2, h2), 0)
+        amp = 0 if frac >= 1 else 3.2 * SS
+        pts = [(0, 0)] + [(edge + amp * math.sin(phase + yy / (SS * 2.2)), yy)
+                          for yy in range(0, h2 + 1, 2)] + [(0, h2)]
+        ImageDraw.Draw(m).polygon(pts, fill=255)
+        m = ImageChops.multiply(m, track)
+        g = self._gradient(w2, h2, [(124, 92, 246), (56, 189, 248), (244, 114, 182)]).convert("RGBA")
+        g.putalpha(m)
+        return g.resize((w, h), Image.LANCZOS)
 
-    def _fps_typed(self, *_):
-        if not self.src_fps:
+    def _render(self, now: float) -> Image.Image:
+        img = self.base.copy()
+        for b in self.blobs:
+            x = b["cx"] + b["ax"] * math.sin(b["wx"] * self.t + b["px"])
+            y = b["cy"] + b["ay"] * math.cos(b["wy"] * self.t + b["py"])
+            img.paste(b["col"], (int(x - b["r"]), int(y - b["r"])), b["mask"])
+        mb = self.mouse_blob
+        img.paste(mb["col"], (int(self.mx - mb["r"]), int(self.my - mb["r"])), mb["mask"])
+        frame = img.resize((W, H), Image.BICUBIC).convert("RGBA")
+        frame.alpha_composite(self.panels)
+        for b in self.buttons:
+            if b.style == "zone" and b.hover < 0.02 and not b.ripples:
+                continue
+            frame.alpha_composite(self._button_tile(b, now), (b.rect[0] - PAD, b.rect[1] - PAD))
+        if self.show_bar and self.progress > 0:
+            frame.alpha_composite(self._bar_tile(min(self.progress, 1.0), self.t * 4.0),
+                                  (BAR[0], BAR[1]))
+        return frame.convert("RGB")
+
+    # ============================================================ widgets
+    def _text(self, x, y, text="", size=10, bold=False, fill=TEXT, anchor="w", **kw):
+        return self.canvas.create_text(x, y, text=text, fill=fill, anchor=anchor,
+                                       font=(FONT, px(size), "bold" if bold else "normal"), **kw)
+
+    def _build_widgets(self):
+        t = self._text
+        t(98, 36, APP_NAME, 19, True)
+        t(98, 62, "Slow 60 FPS → 30 FPS  ·  timing only, no re-encode", 9, fill=MUTED)
+
+        self.zone_txt = t(280, 150, "Drop an MP4 here\nor click to browse", 12, anchor="center",
+                          justify="center", width=480)
+
+        self.info = {}
+        keys = [("Size", "Resolution"), ("Frame rate", "Duration"), ("Video", "Audio"),
+                ("Frames", None)]
+        for r, pair in enumerate(keys):
+            for col, k in enumerate(pair):
+                if not k:
+                    continue
+                x, y = 44 + col * 250, 224 + r * 34
+                t(x, y, k, 8, fill=MUTED)
+                self.info[k] = t(x, y + 15, "—", 10, True)
+
+        self.mode_txt = t(40, 392, f"60 FPS  →  30 FPS   ·   {fmt(FACTOR)}× slower", 11, True, fill=CYAN)
+        t(40, 424, "Output", 8, fill=MUTED)
+        self.out_txt = t(92, 424, "same folder as the video", 9, fill=TEXT)
+
+        self.done = {}
+        for k, (col, row) in {"File": (0, 0), "Duration": (0, 1), "Frame rate": (1, 1),
+                              "Size": (0, 2), "Time": (1, 2)}.items():
+            x, y = 44 + col * 250, 600 + row * 36
+            t(x, y, k, 8, fill=MUTED)
+            self.done[k] = t(x, y + 16, "—", 10, True)
+
+        self.status_txt = t(W // 2, 570, "Select an MP4 file to begin.", 9, fill=MUTED,
+                            anchor="center", justify="center", width=500)
+
+        self.credit_l = t(266, 786, CREDIT_TEXT, 10, True, fill=TEXT, anchor="e")
+        t(280, 786, "•", 10, fill=MUTED, anchor="center")
+        self.credit_r = t(294, 786, TIKTOK_TEXT, 10, True, fill=ACCENT)
+
+        self.buttons = [
+            Btn("zone", PANELS["drop"], "", "zone", self.browse),
+            Btn("start", (20, 468, 372, 516), "Start Processing", "primary", self.start),
+            Btn("cancel", (384, 468, 540, 516), "Cancel", "ghost", self.cancel),
+            Btn("browse", (432, 408, 524, 440), "Browse", "ghost", self.pick_dir),
+            Btn("open", (150, 706, 410, 740), "Open Output Folder", "ghost", self.open_folder),
+        ]
+        for b in self.buttons:
+            if b.text:
+                x0, y0, x1, y1 = b.rect
+                b.text_id = t((x0 + x1) / 2, (y0 + y1) / 2, b.text, 10, True, anchor="center")
+        self.btn = {b.name: b for b in self.buttons}
+        for name in ("start", "cancel", "open"):
+            self._enable(self.btn[name], False)
+
+    def _enable(self, b: Btn, on: bool):
+        b.enabled = on
+        if not on:
+            b.target = 0.0
+        if b.text_id:
+            self.canvas.itemconfig(b.text_id, fill=TEXT if on else "#5d6277")
+
+    def _set(self, item, text, fill=None):
+        self.canvas.itemconfig(item, text=text, **({"fill": fill} if fill else {}))
+
+    def _status(self, text, kind="info"):
+        col = {"info": MUTED, "ok": OK, "err": ERR, "warn": WARN}[kind]
+        self._set(self.status_txt, text, col)
+
+    # ============================================================ events
+    def _hit(self, x, y):
+        for b in reversed(self.buttons):
+            if b.hit(x, y) and (b.enabled or b.style == "zone"):
+                return b
+        return None
+
+    def _link_hit(self, x, y):
+        bb = self.canvas.bbox(self.credit_r)
+        return bool(bb) and bb[0] - 6 <= x <= bb[2] + 6 and bb[1] - 6 <= y <= bb[3] + 6
+
+    def _motion(self, e):
+        self.mtx, self.mty = e.x / LOW, e.y / LOW
+        hit = self._hit(e.x, e.y)
+        for b in self.buttons:
+            b.target = 1.0 if (b is hit and b.enabled) else 0.0
+        self.canvas.config(cursor="hand2" if (hit or self._link_hit(e.x, e.y)) else "")
+
+    def _leave(self, _e):
+        for b in self.buttons:
+            b.target = 0.0
+        self.mtx, self.mty = W / 2 / LOW, H / 2 / LOW
+
+    def _click(self, e):
+        if self._link_hit(e.x, e.y):
+            webbrowser.open(TIKTOK_URL)
+            self.energy += 1.0
             return
-        f = fps_to_factor(self.src_fps, self.fps_var.get())
-        if f:
-            self.factor_var.set(fmt(f, 3))
-        self._refresh_mode()
+        b = self._hit(e.x, e.y)
+        if b:
+            b.ripples.append((time.perf_counter(), e.x - b.rect[0], e.y - b.rect[1]))
+            self.energy += 1.2
+            b.cmd()
 
-    def _chip(self, val: str):
-        self.factor_var.set(val)
-        self._factor_typed()
-
-    # ------------------------------------------------------------ actions
     def _on_drop(self, ev):
         paths = self.root.tk.splitlist(ev.data)
         if paths:
             self.load(Path(paths[0]))
 
+    # ============================================================ actions
     def browse(self):
         p = filedialog.askopenfilename(filetypes=[("MP4 video", "*.mp4 *.mov *.m4v"),
                                                   ("All files", "*.*")])
@@ -278,64 +396,63 @@ class App:
     def pick_dir(self):
         d = filedialog.askdirectory()
         if d:
-            self.out_dir.set(d)
+            self.out_dir = d
+            self._set(self.out_txt, ellipsize(d, 44, tail=True))
 
     def load(self, path: Path):
         try:
             info = analyze(path)
         except (MP4Error, OSError) as e:
-            self.src = None
-            self.src_fps = None
-            self._enable(self.btn_start, False)
-            self._set_status(f"Cannot use this file: {e}", "err")
+            self.src = self.src_fps = None
+            self._enable(self.btn["start"], False)
+            self._status(f"Cannot use this file: {e}", "err")
             messagebox.showerror("Unsupported file", str(e))
             return
         self.src, self.src_fps = path, info.fps
-        self.drop_var.set(f"{path.name}\n{_size(info.file_size)}")
-        v = self.info
-        v["Size"].set(_size(info.file_size))
-        v["Resolution"].set(f"{info.width} × {info.height}" if info.width else "—")
-        v["Frame rate"].set(info.fps_text + (" fps" if info.fps else ""))
-        v["Duration"].set(f"{info.duration:.2f} s")
-        v["Video"].set(info.video_codec)
-        v["Audio"].set(info.audio_codec)
-        v["Frames"].set(str(info.frame_count or "—"))
-        if not self.out_dir.get():
-            self.out_dir.set(str(path.parent))
-        self._factor_typed()
+        self.energy += 1.5
+        self._set(self.zone_txt, f"{ellipsize(path.name, 46)}\n{size_text(info.file_size)}")
+        vals = {"Size": size_text(info.file_size),
+                "Resolution": f"{info.width} × {info.height}" if info.width else "—",
+                "Frame rate": info.fps_text + (" fps" if info.fps else ""),
+                "Duration": f"{info.duration:.2f} s", "Video": info.video_codec,
+                "Audio": info.audio_codec, "Frames": str(info.frame_count or "—")}
+        for k, v in vals.items():
+            self._set(self.info[k], v)
+        if not self.out_dir:
+            self.out_dir = str(path.parent)
+            self._set(self.out_txt, ellipsize(self.out_dir, 44, tail=True))
+        if info.fps:
+            self._set(self.mode_txt, f"{fmt(info.fps)} FPS  →  {fmt(info.fps / FACTOR)} FPS"
+                                     f"   ·   {fmt(FACTOR)}× slower")
         msgs = list(info.warnings)
         if info.fps and abs(float(info.fps) - 60) > 1:
             msgs.append(f"Input is {info.fps_text} fps, not 60.")
-        self._set_status(" ".join(msgs) or "Ready.", "warn" if msgs else "info")
-        self._enable(self.btn_start, True)
+        self._status(" ".join(msgs) or "Ready.", "warn" if msgs else "info")
+        self._enable(self.btn["start"], True)
 
     def start(self):
         if not self.src or self.worker:
             return
-        try:
-            factor = parse_factor(self.factor_var.get())
-        except ValueError as e:
-            messagebox.showwarning("Slow-down factor", str(e))
-            return
-        out_dir = Path(self.out_dir.get() or self.src.parent)
+        out_dir = Path(self.out_dir or self.src.parent)
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             messagebox.showerror("Output folder", str(e))
             return
-        dst = unique_output_path(self.src, out_dir, out_suffix(self.src_fps, factor))
+        suffix = f"_{fmt(self.src_fps / FACTOR)}fps" if self.src_fps else "_slow"
+        dst = unique_output_path(self.src, out_dir, suffix)
         self.cancel_ev.clear()
-        self._enable(self.btn_start, False)
-        self._enable(self.btn_cancel, True)
-        self._enable(self.btn_open, False)
-        for var in self.done.values():
-            var.set("—")
-        self.bar["value"] = 0
+        self._enable(self.btn["start"], False)
+        self._enable(self.btn["cancel"], True)
+        self._enable(self.btn["open"], False)
+        for item in self.done.values():
+            self._set(item, "—")
+        self.progress, self.show_bar = 0.01, True
         src = self.src
 
         def work():
             try:
-                r = patch_file(src, dst, factor,
+                r = patch_file(src, dst, FACTOR,
                                progress=lambda s, f: self.q.put(("p", s, f)),
                                cancel=self.cancel_ev.is_set)
                 self.q.put(("ok", r))
@@ -348,7 +465,7 @@ class App:
 
     def cancel(self):
         self.cancel_ev.set()
-        self._set_status("Cancelling…", "warn")
+        self._status("Cancelling…", "warn")
 
     def open_folder(self):
         if not self.last_out:
@@ -359,42 +476,68 @@ class App:
         else:
             subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", d])
 
-    def _poll(self):
+    def _drain(self):
         try:
             while True:
                 m = self.q.get_nowait()
                 if m[0] == "p":
-                    self._set_status(m[1])
-                    self.bar["value"] = m[2] * 100
+                    self._status(m[1])
+                    self.progress = max(0.01, m[2])
                     continue
                 self.worker = None
-                self._enable(self.btn_cancel, False)
-                self._enable(self.btn_start, bool(self.src))
+                self._enable(self.btn["cancel"], False)
+                self._enable(self.btn["start"], bool(self.src))
                 if m[0] == "ok":
                     self._done(m[1])
                 elif m[0] == "cancel":
-                    self.bar["value"] = 0
-                    self._set_status("Cancelled. No output was written.", "warn")
+                    self.show_bar = False
+                    self._status("Cancelled. No output was written.", "warn")
                 else:
-                    self.bar["value"] = 0
-                    self._set_status("Failed. The original file was not modified.", "err")
+                    self.show_bar = False
+                    self._status("Failed. The original file was not modified.", "err")
                     messagebox.showerror("Processing failed", m[1])
         except queue.Empty:
             pass
-        self.root.after(80, self._poll)
 
     def _done(self, r):
         o = r.info_after
         self.last_out = r.output
-        self.bar["value"] = 100
-        self._set_status("Done — all validation checks passed.", "ok")
-        d = self.done
-        d["File"].set(r.output.name)
-        d["Duration"].set(f"{o.duration:.2f} s")
-        d["Frame rate"].set(o.fps_text + " fps")
-        d["Size"].set(_size(r.output_size))
-        d["Time"].set(f"{r.elapsed:.2f} s")
-        self._enable(self.btn_open, True)
+        self.progress = 1.0
+        self.energy += 2.0
+        self._status("Done — all validation checks passed.", "ok")
+        vals = {"File": ellipsize(r.output.name, 52), "Duration": f"{o.duration:.2f} s",
+                "Frame rate": o.fps_text + " fps", "Size": size_text(r.output_size),
+                "Time": f"{r.elapsed:.2f} s"}
+        for k, v in vals.items():
+            self._set(self.done[k], v)
+        self._enable(self.btn["open"], True)
+
+    # ============================================================ loop
+    def _tick(self):
+        try:
+            now = time.perf_counter()
+            dt = min(now - self._last, 0.1)
+            self._last = now
+            self._drain()
+            target = 2.2 if self.worker else 1.0
+            self.energy += (target - self.energy) * min(1.0, dt * 2.0)
+            self.t += dt * self.energy * 0.9
+            k = min(1.0, dt * 10)
+            for b in self.buttons:
+                b.hover += (b.target - b.hover) * k
+            m = min(1.0, dt * 4)
+            self.mx += (self.mtx - self.mx) * m
+            self.my += (self.mty - self.my) * m
+            self.photo.paste(self._render(now))
+            # shimmering link colour
+            s = 0.5 + 0.5 * math.sin(self.t * 1.6)
+            r1, g1, b1 = (0xa7, 0x8b, 0xfa)
+            r2, g2, b2 = (0x67, 0xe8, 0xf9)
+            col = "#%02x%02x%02x" % (int(r1 + (r2 - r1) * s), int(g1 + (g2 - g1) * s),
+                                     int(b1 + (b2 - b1) * s))
+            self.canvas.itemconfig(self.credit_r, fill=col)
+        finally:
+            self.root.after(33, self._tick)
 
 
 def run():
